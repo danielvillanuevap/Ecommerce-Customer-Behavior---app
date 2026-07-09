@@ -574,6 +574,20 @@ def feature_cards(items):
     st.markdown(f"<div class='feature-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
 
+def spec_card_html(title, rows):
+    rows_html = "".join(
+        f'<div class="cluster-metric-row"><span>{label}</span><span>{value}</span></div>' for label, value in rows
+    )
+    return f'<div class="cluster-card"><h3>{title}</h3>{rows_html}</div>'
+
+
+def render_spec_cards(cards):
+    columns = st.columns(len(cards))
+    for col_widget, (title, rows) in zip(columns, cards):
+        with col_widget:
+            st.markdown(spec_card_html(title, rows), unsafe_allow_html=True)
+
+
 def sidebar_source():
     with st.sidebar:
         st.title("Churn Intelligence")
@@ -1666,7 +1680,7 @@ def render_context_and_data(data):
 def render_visualization_communication(data, model, metrics, matrix, report):
     hero(
         "Visualizacion y comunicacion",
-        "Cierre del proyecto: resultados finales y conclusiones, con base en el informe del proyecto.",
+        "Cierre del proyecto: resultados finales y conclusiones.",
         "Resultados y conclusiones",
     )
 
@@ -1774,41 +1788,113 @@ def render_individual_prediction(data, model):
 
     if "customer_snapshot" not in st.session_state:
         st.info("Completa los datos del cliente y presiona **Predecir** para ver el resultado.")
+    else:
+        customer = st.session_state["customer_snapshot"]
+        result = prediction_output(model, customer, threshold=DECISION_THRESHOLD)
+
+        probability = float(result["Probabilidad_Fuga"].iloc[0])
+        level = result["Riesgo"].iloc[0]
+        prediction = result["Prediccion"].iloc[0]
+        color = RISK_COLORS[level]
+
+        st.markdown("#### Resultado de la prediccion")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Probabilidad de fuga", f"{probability * 100:.1f}%")
+        c2.metric("Riesgo", level)
+        c3.metric("Decision", prediction)
+        st.progress(min(max(probability, 0.0), 1.0))
+        st.caption(f"Umbral de decision: {DECISION_THRESHOLD:.2f} (el mismo usado en la evaluacion final del notebook).")
+
+        st.markdown(
+            f"""
+            <div class="risk-card" style="border-left-color:{color}">
+                <h3>Recomendaciones</h3>
+                <p>{risk_action(level)}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("#### Principales senales detectadas")
+        signals = risk_signal_table(customer, data)
+        render_signal_cards(signals)
+
+        st.markdown("#### Simulador que pasaria si")
+        simulation = what_if_scenarios(model, customer, data, DECISION_THRESHOLD)
+        render_whatif_cards(simulation)
+
+    st.divider()
+    render_batch_csv_prediction(data, model)
+
+
+def render_batch_csv_prediction(data, model):
+    st.markdown("#### Prediccion por CSV")
+    st.caption(
+        "Sube un CSV con datos de varios clientes (mismas columnas del dataset, en espanol o ingles) "
+        "para calcular la probabilidad de fuga de todos a la vez."
+    )
+    batch_file = st.file_uploader("CSV de clientes", type=["csv"], key="batch_csv_uploader")
+
+    if batch_file is None:
         return
 
-    customer = st.session_state["customer_snapshot"]
-    result = prediction_output(model, customer, threshold=DECISION_THRESHOLD)
+    try:
+        batch_data = pd.read_csv(batch_file)
+    except Exception as exc:
+        st.error(f"No se pudo leer el archivo: {exc}")
+        return
 
-    probability = float(result["Probabilidad_Fuga"].iloc[0])
-    level = result["Riesgo"].iloc[0]
-    prediction = result["Prediccion"].iloc[0]
-    color = RISK_COLORS[level]
+    scored = prediction_output(model, batch_data, threshold=DECISION_THRESHOLD).sort_values(
+        "Probabilidad_Fuga", ascending=False
+    )
+    total = len(scored)
+    risk_counts = scored["Riesgo"].value_counts()
+    pred_counts = scored["Prediccion"].value_counts()
 
-    st.markdown("#### Resultado de la prediccion")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Probabilidad de fuga", f"{probability * 100:.1f}%")
-    c2.metric("Riesgo", level)
-    c3.metric("Decision", prediction)
-    st.progress(min(max(probability, 0.0), 1.0))
-    st.caption(f"Umbral de decision: {DECISION_THRESHOLD:.2f} (el mismo usado en la evaluacion final del notebook).")
+    with c1:
+        st.metric("Registros procesados", f"{total:,}")
+    with c2:
+        st.markdown(
+            spec_card_html(
+                "Riesgo",
+                [(level, f"{int(risk_counts.get(level, 0)):,}") for level in ["Alto", "Medio", "Bajo"]],
+            ),
+            unsafe_allow_html=True,
+        )
+    with c3:
+        activo_pct = pred_counts.get("Activo", 0) / total * 100 if total else 0
+        fuga_pct = pred_counts.get("Fuga", 0) / total * 100 if total else 0
+        st.markdown(
+            spec_card_html(
+                "Balance de la data",
+                [("Activo", f"{activo_pct:.1f}%"), ("Fuga", f"{fuga_pct:.1f}%")],
+            ),
+            unsafe_allow_html=True,
+        )
 
-    st.markdown(
-        f"""
-        <div class="risk-card" style="border-left-color:{color}">
-            <h3>Recomendaciones</h3>
-            <p>{risk_action(level)}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    priority_cols = ["Probabilidad_Fuga", "Riesgo", "Prediccion"]
+    other_cols = [col for col in scored.columns if col not in priority_cols and col != "Accion_Recomendada"]
+    display_table = scored[priority_cols + other_cols].head(200).rename(columns=pretty_label)
+    st.dataframe(display_table, hide_index=True, use_container_width=True)
+
+    st.download_button(
+        "Descargar predicciones CSV",
+        data=scored.to_csv(index=False).encode("utf-8"),
+        file_name="predicciones_fuga_clientes.csv",
+        mime="text/csv",
     )
 
-    st.markdown("#### Principales senales detectadas")
-    signals = risk_signal_table(customer, data)
-    render_signal_cards(signals)
-
-    st.markdown("#### Simulador que pasaria si")
-    simulation = what_if_scenarios(model, customer, data, DECISION_THRESHOLD)
-    render_whatif_cards(simulation)
+    st.markdown("#### Recomendaciones")
+    risk_alto = int(risk_counts.get("Alto", 0))
+    risk_medio = int(risk_counts.get("Medio", 0))
+    recommendations = []
+    if risk_alto > 0:
+        recommendations.append(f"Prioriza contacto inmediato con los {risk_alto} clientes de riesgo alto.")
+    if risk_medio > 0:
+        recommendations.append(f"Activa campanas preventivas para los {risk_medio} clientes de riesgo medio.")
+    recommendations.append("Descarga el CSV para planificar las acciones de retencion por cliente.")
+    st.markdown("\n".join(f"- {line}" for line in recommendations))
 
 
 def render_segments(data):
@@ -2059,12 +2145,34 @@ def render_model_methodology(data, model, metrics, matrix, report):
         f"En el set de prueba: ROC AUC = {metrics.get('ROC AUC', 0):.3f}, "
         f"Recall = {metrics.get('Recall', 0):.3f}, F1 (clase fuga) = {metrics.get('F1', 0):.3f}."
     )
-    feature_cards(
+    render_spec_cards(
         [
-            ("Seleccion de variables", "ANOVA k=35: redujo 48 variables transformadas a 35 sin perder desempeno."),
-            ("Hiperparametros", "max_leaf_nodes=63, learning_rate=0.05, l2_regularization=0.1."),
-            ("Balanceo de clases", "class_weight='balanced': preserva mejor la precision que SMOTE o ADASYN."),
-            ("Despliegue", "Entrenado una vez con train_model.py y servido congelado, sin reentrenar por sesion."),
+            (
+                "Seleccion de variables",
+                [
+                    ("Metodo", "ANOVA (SelectKBest)"),
+                    ("Variables originales", "48"),
+                    ("Variables seleccionadas", "35"),
+                    ("Resultado", "Sin perdida de desempeno"),
+                ],
+            ),
+            (
+                "Hiperparametros",
+                [
+                    ("max_leaf_nodes", "63"),
+                    ("learning_rate", "0.05"),
+                    ("l2_regularization", "0.1"),
+                    ("class_weight", "balanced"),
+                ],
+            ),
+            (
+                "Balanceo de clases",
+                [
+                    ("Metodo", "class_weight='balanced'"),
+                    ("Alternativas evaluadas", "SMOTE, ADASYN"),
+                    ("Resultado", "Mejor precision"),
+                ],
+            ),
         ]
     )
 
